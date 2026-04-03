@@ -103,6 +103,7 @@ class RefreshTokenRegistrationEngine:
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         browser_mode: str = "headless",
+        extra_config: Optional[Dict[str, Any]] = None,
     ):
         """
         初始化注册引擎
@@ -118,6 +119,7 @@ class RefreshTokenRegistrationEngine:
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "headless").strip().lower()
+        self.extra_config = dict(extra_config or {})
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
@@ -148,6 +150,28 @@ class RefreshTokenRegistrationEngine:
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
         self._post_otp_continue_url: str = ""
         self._post_otp_page_type: str = ""
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        raw = str(value or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    def _allow_unknown_ip_location(self) -> bool:
+        for key in (
+            "chatgpt_allow_unknown_ip_location",
+            "allow_unknown_ip_location",
+            "chatgpt_allow_none_ip_location",
+            "allow_none_ip_location",
+        ):
+            if key in self.extra_config:
+                return self._to_bool(self.extra_config.get(key), default=True)
+        return True
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -1316,11 +1340,16 @@ class RefreshTokenRegistrationEngine:
             self._log("1. 检查 IP 地理位置...")
             ip_ok, location = self._check_ip_location()
             if not ip_ok:
-                result.error_message = f"IP 地理位置不支持: {location}"
-                self._log(f"IP 检查失败: {location}", "error")
-                return result
-
-            self._log(f"IP 位置: {location}")
+                if location is None and self._allow_unknown_ip_location():
+                    self._log("IP 地理位置未识别，跳过地区校验并继续执行", "warning")
+                else:
+                    result.error_message = f"IP 地理位置不支持: {location}"
+                    self._log(f"IP 检查失败: {location}", "error")
+                    return result
+            if location:
+                self._log(f"IP 位置: {location}")
+            else:
+                self._log("IP 位置: 未识别", "warning")
 
             # 2. 创建邮箱
             self._log("2. 创建邮箱...")

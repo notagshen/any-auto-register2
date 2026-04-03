@@ -5,7 +5,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
-    """将 socks5:// 规范化为 socks5h://，避免本地 DNS 泄漏。"""
+    """规范化代理 URL。"""
     if proxy_url is None:
         return None
 
@@ -14,25 +14,38 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
         return None
 
     parts = urlsplit(value)
-    if (parts.scheme or "").lower() == "socks5":
-        parts = parts._replace(scheme="socks5h")
-        return urlunsplit(parts)
+    normalized_parts = parts
+    changed = False
+
+    # 兼容 http://:@host:port 这类空账号密码写法，避免底层客户端把它当成异常代理。
+    if parts.username == "" and parts.password == "" and "@" in parts.netloc:
+        normalized_parts = normalized_parts._replace(netloc=parts.netloc.split("@", 1)[1])
+        changed = True
+
+    if (normalized_parts.scheme or "").lower() == "socks5":
+        normalized_parts = normalized_parts._replace(scheme="socks5h")
+        changed = True
+
+    if changed:
+        return urlunsplit(normalized_parts)
     return value
 
 
 def build_requests_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str, str]]:
-    if not proxy_url:
+    normalized = normalize_proxy_url(proxy_url)
+    if not normalized:
         return None
-    return {"http": proxy_url, "https": proxy_url}
+    return {"http": normalized, "https": normalized}
 
 
 def build_playwright_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str, str]]:
-    if not proxy_url:
+    normalized = normalize_proxy_url(proxy_url)
+    if not normalized:
         return None
 
-    parts = urlsplit(proxy_url)
+    parts = urlsplit(normalized)
     if not parts.scheme or not parts.hostname or parts.port is None:
-        return {"server": proxy_url}
+        return {"server": normalized}
 
     config = {"server": f"{parts.scheme}://{parts.hostname}:{parts.port}"}
     if parts.username:
