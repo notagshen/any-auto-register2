@@ -1,3 +1,5 @@
+import base64
+import json
 import unittest
 from unittest import mock
 
@@ -51,6 +53,11 @@ class _DummyHTTPClient:
 
 
 class RegistrationEngineFlowTests(unittest.TestCase):
+    @staticmethod
+    def _encode_cookie_payload(data):
+        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
     def _make_engine(self):
         return RefreshTokenRegistrationEngine(
             email_service=DummyEmailService(),
@@ -227,6 +234,119 @@ class RegistrationEngineFlowTests(unittest.TestCase):
         create_account.assert_not_called()
         restart_login.assert_not_called()
         complete_exchange.assert_called_once()
+
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token",
+        return_value='{"flow":"password_verify"}',
+    )
+    def test_submit_login_password_uses_password_verify_sentinel(self, mock_build_sentinel):
+        engine = self._make_engine()
+        engine._device_id = "device-fixed"
+        engine.password = "Secret123!"
+        engine.session = mock.Mock()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "/email-verification",
+        }
+        engine.session.post.return_value = response
+
+        result = engine._submit_login_password()
+
+        self.assertTrue(result.success)
+        mock_build_sentinel.assert_called_once_with(
+            engine.session, "device-fixed", flow="password_verify"
+        )
+        headers = engine.session.post.call_args.kwargs["headers"]
+        self.assertEqual(headers["openai-sentinel-token"], '{"flow":"password_verify"}')
+
+    def test_resolve_oauth_callback_url_handles_organization_select_redirect(self):
+        engine = self._make_engine()
+        engine._device_id = "device-fixed"
+        engine.session = mock.Mock()
+        cookie_payload = {
+            "workspaces": [{"id": "ws-123", "kind": "personal"}],
+        }
+        engine.session.cookies.get.side_effect = lambda name, default=None: (
+            self._encode_cookie_payload(cookie_payload)
+            if name == "oai-client-auth-session"
+            else default
+        )
+
+        consent_response = mock.Mock(status_code=200, headers={}, url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        workspace_response = mock.Mock(status_code=200, headers={}, url="https://auth.openai.com/api/accounts/workspace/select")
+        workspace_response.json.return_value = {
+            "continue_url": "/sign-in-with-chatgpt/codex/organization",
+            "page": {"type": "organization_select"},
+            "data": {
+                "orgs": [
+                    {
+                        "id": "org-123",
+                        "projects": [{"id": "proj-123"}],
+                    }
+                ]
+            },
+        }
+        org_response = mock.Mock(
+            status_code=302,
+            headers={
+                "Location": "http://localhost:1455/auth/callback?code=auth-code&state=oauth-state"
+            },
+        )
+
+        engine.session.get.side_effect = [consent_response]
+        engine.session.post.side_effect = [workspace_response, org_response]
+
+        callback_url, workspace_id = engine._resolve_oauth_callback_url(
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        )
+
+        self.assertEqual(workspace_id, "ws-123")
+        self.assertEqual(
+            callback_url,
+            "http://localhost:1455/auth/callback?code=auth-code&state=oauth-state",
+        )
+        self.assertEqual(engine.session.post.call_count, 2)
+
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token",
+        return_value='{"source":"pow"}',
+    )
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.get_sentinel_token_via_browser",
+        return_value='{"source":"browser"}',
+    )
+    def test_check_sentinel_prefers_browser_for_register_and_create_account_flows(
+        self, mock_browser_token, mock_pow_token
+    ):
+        engine = self._make_engine()
+        engine.session = mock.Mock()
+
+        token = engine._check_sentinel("device-fixed", flow="username_password_create")
+        self.assertEqual(token, '{"source":"browser"}')
+        mock_browser_token.assert_called_once()
+        mock_pow_token.assert_not_called()
+
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token",
+        return_value='{"source":"pow"}',
+    )
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.get_sentinel_token_via_browser",
+        return_value=None,
+    )
+    def test_check_sentinel_falls_back_to_pow_when_browser_token_missing(
+        self, mock_browser_token, mock_pow_token
+    ):
+        engine = self._make_engine()
+        engine.session = mock.Mock()
+
+        token = engine._check_sentinel("device-fixed", flow="oauth_create_account")
+        self.assertEqual(token, '{"source":"pow"}')
+        mock_browser_token.assert_called_once()
+        mock_pow_token.assert_called_once_with(
+            engine.session, "device-fixed", flow="oauth_create_account"
+        )
 
 
 if __name__ == "__main__":
